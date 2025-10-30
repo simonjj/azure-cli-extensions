@@ -536,3 +536,10 @@ def load_arguments(self, _):
         c.argument('termination_grace_period', options_list=['--termination-grace-period', '-t'], type=int, help="Time in seconds to drain requests during ingress shutdown. Default 500, minimum 0, maximum 3600.")
         c.argument('request_idle_timeout', options_list=['--request-idle-timeout'], type=int, help="Timeout in minutes for idle requests. Default 4, minimum 4, maximum 30.")
         c.argument('header_count_limit', options_list=['--header-count-limit'], type=int, help="Limit of http headers per request. Default 100, minimum 1.")
+
+    # Compose
+    with self.argument_context('containerapp compose create') as c:
+        c.argument('dry_run', options_list=['--dry-run'], arg_type=get_three_state_flag(),
+                   help='Preview deployment without creating actual Azure resources. Generates a detailed report of container apps, workload profiles, role assignments, and environment variable injections.')
+        c.argument('replace_all', options_list=['--replace-all'], arg_type=get_three_state_flag(),
+                   help='Replace all existing container apps in the environment. By default, only matching apps are updated and new ones are created.')
