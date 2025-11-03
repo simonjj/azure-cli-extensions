@@ -167,6 +167,10 @@ def validate_models_configuration(models):
     dns_label_pattern = re.compile(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
     
     for model_name, model_config in models.items():
+        # Skip x-azure-deployment metadata
+        if model_name == 'x-azure-deployment':
+            continue
+            
         if not dns_label_pattern.match(model_name):
             raise InvalidArgumentValueError(
                 f"Invalid model name '{model_name}'. Model names must be valid DNS labels: "
@@ -215,80 +219,62 @@ def validate_model_source(model_name, source):
 
 def check_gpu_profile_availability(cmd, resource_group_name, env_name, location):
     """
-    Check if GPU workload profiles are available in the current region.
+    Check if GPU workload profiles are available in the region.
     
     Args:
         cmd: Azure CLI command context
         resource_group_name: Resource group name
         env_name: Container Apps environment name
         location: Azure region
-        
+    
     Returns:
         List of available GPU profile types
     """
     from knack.log import get_logger
-    from ._clients import WorkloadProfileClient
+    from azure.cli.core.util import send_raw_request
+    from azure.cli.core.commands.client_factory import get_subscription_id
+    import json
     
     logger = get_logger(__name__)
     
     try:
-        client = WorkloadProfileClient(cmd.cli_ctx, resource_group_name, env_name, location)
-        supported_profiles = client.list_supported()
+        # Use Azure REST API to list supported workload profiles
+        management_hostname = cmd.cli_ctx.cloud.endpoints.resource_manager
+        sub_id = get_subscription_id(cmd.cli_ctx)
+        api_version = "2024-03-01"
+        
+        url_fmt = "{}/subscriptions/{}/providers/Microsoft.App/locations/{}/availableManagedEnvironmentsWorkloadProfileTypes?api-version={}"
+        request_url = url_fmt.format(
+            management_hostname.strip('/'),
+            sub_id,
+            location,
+            api_version
+        )
+        
+        r = send_raw_request(cmd.cli_ctx, "GET", request_url)
+        response = r.json()
+        
+        supported_profiles = response.get('value', [])
         
         # Filter for GPU profiles
         gpu_profiles = [
-            profile for profile in supported_profiles 
-            if 'GPU' in profile.get('name', '').upper() or 
-               'GPU' in profile.get('category', '').upper()
+            profile for profile in supported_profiles
+            if 'GPU' in profile.get('name', '').upper() or
+               'GPU' in profile.get('properties', {}).get('category', '').upper()
         ]
         
         if gpu_profiles:
             logger.info(f"Found {len(gpu_profiles)} GPU profile(s) in {location}")
         else:
             logger.warning(f"No GPU profiles available in {location}")
-            
-        return gpu_profiles
         
+        return gpu_profiles
+    
     except Exception as e:
         logger.warning(f"Failed to check GPU profile availability: {str(e)}")
         return []
 
-
-def get_gpu_profile_alternatives(cmd, resource_group_name, env_name, location):
-    """
-    Get list of available GPU workload profile types with their specifications.
-    
-    Args:
-        cmd: Azure CLI command context
-        resource_group_name: Resource group name
-        env_name: Container Apps environment name
-        location: Azure region
-        
-    Returns:
-        List of dictionaries with GPU profile details
-    """
-    from knack.log import get_logger
-    
-    logger = get_logger(__name__)
-    gpu_profiles = check_gpu_profile_availability(cmd, resource_group_name, env_name, location)
-    
-    alternatives = []
-    for profile in gpu_profiles:
-        alternatives.append({
-            'name': profile.get('name'),
-            'displayName': profile.get('displayName', profile.get('name')),
-            'cores': profile.get('cores'),
-            'memory': profile.get('memoryGiB'),
-            'category': profile.get('category')
-        })
-    
-    if alternatives:
-        logger.info(f"Available GPU profiles: {[p['name'] for p in alternatives]}")
-    
-    return alternatives
-
-
-def create_gpu_workload_profile_if_needed(cmd, resource_group_name, env_name, location):
+def create_gpu_workload_profile_if_needed(cmd, resource_group_name, env_name, location, requested_gpu_profile_type=None):
     """
     Check for existing GPU profile and create one if needed.
     
@@ -297,6 +283,7 @@ def create_gpu_workload_profile_if_needed(cmd, resource_group_name, env_name, lo
         resource_group_name: Resource group name
         env_name: Container Apps environment name
         location: Azure region
+        requested_gpu_profile_type: Specific GPU profile type requested (e.g., Consumption-GPU-NC8as-T4)
         
     Returns:
         Name of the GPU workload profile to use
@@ -307,21 +294,30 @@ def create_gpu_workload_profile_if_needed(cmd, resource_group_name, env_name, lo
     from knack.log import get_logger
     from azure.cli.core.azclierror import ResourceNotFoundError
     from ._client_factory import handle_raw_exception
-    from .custom import ContainerAppEnvironmentClient
+    from ._clients import ManagedEnvironmentClient
     
     logger = get_logger(__name__)
     
-    # Check if environment already has a GPU profile
+    # Check if environment already has a GPU profile that matches the request
     try:
-        env_client = ContainerAppEnvironmentClient(cmd.cli_ctx)
-        env = env_client.show(resource_group_name, env_name)
+        # Use class methods directly - no instantiation needed
+        env = ManagedEnvironmentClient.show(cmd, resource_group_name, env_name)
         
         workload_profiles = env.get('properties', {}).get('workloadProfiles', [])
-        for profile in workload_profiles:
-            profile_type = profile.get('workloadProfileType', '')
-            if 'GPU' in profile_type.upper():
-                logger.info(f"Found existing GPU profile: {profile.get('name')}")
-                return profile.get('name')
+        
+        # If specific GPU type requested, check if it exists
+        if requested_gpu_profile_type:
+            for profile in workload_profiles:
+                if profile.get('workloadProfileType') == requested_gpu_profile_type:
+                    logger.info(f"Found requested GPU profile in environment: {requested_gpu_profile_type}")
+                    return requested_gpu_profile_type
+        else:
+            # No specific request, return any GPU profile found
+            for profile in workload_profiles:
+                profile_type = profile.get('workloadProfileType', '')
+                if 'GPU' in profile_type.upper():
+                    logger.info(f"Found existing GPU profile: {profile.get('name')}")
+                    return profile.get('name')
     except Exception as e:
         logger.warning(f"Failed to check existing profiles: {str(e)}")
     
@@ -334,29 +330,141 @@ def create_gpu_workload_profile_if_needed(cmd, resource_group_name, env_name, lo
         alternatives_msg += "\n\nTry deploying to regions with GPU support: westus3, eastus, northeurope"
         raise ResourceNotFoundError(alternatives_msg)
     
-    # Use the first available GPU profile type
-    gpu_profile_type = available_gpu[0].get('name')
+    # Use requested GPU profile type if provided, otherwise use first available
+    if requested_gpu_profile_type:
+        # Validate that requested profile is available
+        available_types = [p.get('name') for p in available_gpu]
+        if requested_gpu_profile_type in available_types:
+            gpu_profile_type = requested_gpu_profile_type
+            logger.info(f"Using requested GPU profile type: {gpu_profile_type}")
+        else:
+            logger.warning(f"Requested GPU profile '{requested_gpu_profile_type}' not available in {location}")
+            logger.warning(f"Available GPU profiles: {available_types}")
+            gpu_profile_type = available_gpu[0].get('name')
+            logger.warning(f"Falling back to: {gpu_profile_type}")
+    else:
+        gpu_profile_type = available_gpu[0].get('name')
+        logger.info(f"No specific GPU profile requested, using: {gpu_profile_type}")
+    
+    # Check if it's a consumption-based GPU profile
+    if gpu_profile_type.startswith('Consumption-'):
+        # Consumption profiles need to be added to the environment's workloadProfiles array
+        logger.info(f"Adding consumption-based GPU profile to environment: {gpu_profile_type}")
+        
+        from azure.cli.core.util import send_raw_request
+        from azure.cli.core.commands.client_factory import get_subscription_id
+        import json
+        
+        # Get current environment configuration
+        env = ManagedEnvironmentClient.show(cmd, resource_group_name, env_name)
+        
+        # Check if profile already exists
+        existing_profiles = env.get('properties', {}).get('workloadProfiles', [])
+        for profile in existing_profiles:
+            if profile.get('workloadProfileType') == gpu_profile_type:
+                logger.info(f"GPU profile already exists: {gpu_profile_type}")
+                return gpu_profile_type
+        
+        # Add the consumption GPU profile to the environment
+        new_profile = {
+            "name": gpu_profile_type,
+            "workloadProfileType": gpu_profile_type
+        }
+        
+        # Clean existing profiles - remove unsupported properties like enableFips
+        cleaned_profiles = []
+        for profile in existing_profiles:
+            cleaned = {
+                "name": profile.get("name"),
+                "workloadProfileType": profile.get("workloadProfileType")
+            }
+            # Only add minimumCount/maximumCount if they exist and aren't for Consumption profile
+            if not profile.get("workloadProfileType", "").startswith("Consumption"):
+                if "minimumCount" in profile:
+                    cleaned["minimumCount"] = profile["minimumCount"]
+                if "maximumCount" in profile:
+                    cleaned["maximumCount"] = profile["maximumCount"]
+            cleaned_profiles.append(cleaned)
+        
+        cleaned_profiles.append(new_profile)
+        
+        # Update the environment
+        management_hostname = cmd.cli_ctx.cloud.endpoints.resource_manager
+        sub_id = get_subscription_id(cmd.cli_ctx)
+        api_version = "2024-03-01"
+        
+        url_fmt = "{}/subscriptions/{}/resourceGroups/{}/providers/Microsoft.App/managedEnvironments/{}?api-version={}"
+        request_url = url_fmt.format(
+            management_hostname.strip('/'),
+            sub_id,
+            resource_group_name,
+            env_name,
+            api_version
+        )
+        
+        # Update environment with new workload profile
+        env_update = {
+            "properties": {
+                "workloadProfiles": cleaned_profiles
+            },
+            "location": env.get('location')
+        }
+        
+        r = send_raw_request(cmd.cli_ctx, "PATCH", request_url, body=json.dumps(env_update))
+        logger.info(f"Added GPU profile to environment: {gpu_profile_type}")
+        return gpu_profile_type
+    
     profile_name = 'gpu-profile'
     
     logger.info(f"Creating GPU workload profile '{profile_name}' of type '{gpu_profile_type}'")
     
     # Create the workload profile using existing add_workload_profile function
+    # Create the workload profile using Azure REST API
     try:
-        from .custom import add_workload_profile
-        add_workload_profile(
-            cmd,
-            env_name,
+        from azure.cli.core.util import send_raw_request
+        from azure.cli.core.commands.client_factory import get_subscription_id
+        import json
+        
+        management_hostname = cmd.cli_ctx.cloud.endpoints.resource_manager
+        sub_id = get_subscription_id(cmd.cli_ctx)
+        api_version = "2024-03-01"
+        
+        # Create workload profile
+        url_fmt = "{}/subscriptions/{}/resourceGroups/{}/providers/Microsoft.App/managedEnvironments/{}/workloadProfiles/{}?api-version={}"
+        request_url = url_fmt.format(
+            management_hostname.strip('/'),
+            sub_id,
             resource_group_name,
-            workload_profile_name=profile_name,
-            workload_profile_type=gpu_profile_type,
-            min_nodes=1,
-            max_nodes=3
+            env_name,
+            profile_name,
+            api_version
         )
+        
+        profile_body = {
+            "properties": {
+                "workloadProfileType": gpu_profile_type,
+                "minimumCount": 1,
+                "maximumCount": 3
+            }
+        }
+        
+        logger.info(f"Creating workload profile at: {request_url}")
+        logger.info(f"Profile body: {json.dumps(profile_body)}")
+        
+        r = send_raw_request(cmd.cli_ctx, "PUT", request_url, body=json.dumps(profile_body))
+        
+        if r.status_code >= 400:
+            logger.error(f"Failed to create workload profile. Status: {r.status_code}, Response: {r.text}")
+            raise Exception(f"Failed to create workload profile: {r.status_code} - {r.text}")
+        
         logger.info(f"Successfully created GPU profile: {profile_name}")
         return profile_name
     except Exception as e:
+        logger.error(f"Exception creating workload profile: {str(e)}")
         handle_raw_exception(e)
         raise
+
+
 
 
 def create_models_container_app(cmd, resource_group_name, env_name, env_id, models, 
@@ -377,7 +485,6 @@ def create_models_container_app(cmd, resource_group_name, env_name, env_id, mode
         Created container app resource
     """
     from knack.log import get_logger
-    from azure.cli.command_modules.containerapp._clients import ContainerAppClient
     import json
     
     logger = get_logger(__name__)
@@ -385,48 +492,109 @@ def create_models_container_app(cmd, resource_group_name, env_name, env_id, mode
     app_name = 'models'
     logger.info(f"Creating models container app '{app_name}' with GPU profile '{gpu_profile_name}'")
     
+    # Determine GPU-appropriate resources based on profile type
+    # T4 GPU: 8 vCPUs, 32GB memory (NC8as_T4_v3)
+    # A100 GPU: 24 vCPUs, 220GB memory (NC24ads_A100_v4)
+    if 'A100' in gpu_profile_name.upper():
+        gpu_cpu = 24.0
+        gpu_memory = '220Gi'
+        logger.info(f"Detected A100 GPU profile - setting resources to {gpu_cpu} CPU / {gpu_memory}")
+    else:
+        # Default to T4 resources
+        gpu_cpu = 8.0
+        gpu_memory = '32Gi'
+        logger.info(f"Detected T4 GPU profile - setting resources to {gpu_cpu} CPU / {gpu_memory}")
+    
     # Build model configuration for model-runner-config
     model_config = {
         'models': {}
     }
     for model_name, model_spec in models.items():
+        # Skip x-azure-deployment metadata
+        if model_name == 'x-azure-deployment':
+            continue
         if isinstance(model_spec, dict):
             model_config['models'][model_name] = model_spec
         else:
             # Simple string format (just model name)
             model_config['models'][model_name] = {'source': f'ollama://{model_spec}'}
     
-    # Container configuration
+    # Container configuration matching successful deployment pattern
     containers = [
         {
             'name': 'model-runner',
-            'image': 'mcr.microsoft.com/azure-containers/model-runner:latest',
+            'image': 'docker/model-runner:latest',
             'resources': {
-                'cpu': 2.0,
-                'memory': '4Gi'
+                'cpu': gpu_cpu,
+                'memory': gpu_memory
             },
             'env': [
                 {
-                    'name': 'MODEL_CONFIG_ENDPOINT',
-                    'value': 'http://localhost:8001/config'
+                    'name': 'MODEL_RUNNER_PORT',
+                    'value': '12434'
+                },
+                {
+                    'name': 'MODEL_RUNNER_HOST',
+                    'value': '0.0.0.0'
+                },
+                {
+                    'name': 'MODEL_RUNNER_ENVIRONMENT',
+                    'value': 'moby'
+                },
+                {
+                    'name': 'MODEL_RUNNER_GPU',
+                    'value': 'cuda'
                 }
             ]
         },
         {
             'name': 'model-runner-config',
-            'image': 'mcr.microsoft.com/azure-containers/model-runner-config:latest',
+            'image': 'simon.azurecr.io/model-runner-config:11012025-1554',
             'resources': {
-                'cpu': 0.25,
-                'memory': '0.5Gi'
+                'cpu': 0.5,
+                'memory': '1Gi'
             },
             'env': [
                 {
+                    'name': 'MODEL_RUNNER_URL',
+                    'value': 'http://localhost:12434'
+                },
+                {
                     'name': 'MODELS_CONFIG',
                     'value': json.dumps(model_config)
+                },
+                {
+                    'name': 'CONFIGURE_ON_STARTUP', # whether to configure models on startup
+                    'value': 'true'
+                },
+                {
+                    'name': 'STARTUP_DELAY', # how long do we want to wait after startup before configuring models
+                    'value': '30' # seconds
                 }
             ]
         }
     ]
+    
+    # Check for ingress configuration in x-azure-deployment
+    ingress_config = {
+        'external': False,
+        'targetPort': 12434,  # MODEL_RUNNER_PORT
+        'transport': 'http',
+        'allowInsecure': False
+    }
+    
+    # Override with x-azure-deployment ingress settings if present
+    if 'x-azure-deployment' in models:
+        azure_deployment = models.get('x-azure-deployment', {})
+        if 'ingress' in azure_deployment:
+            ingress_override = azure_deployment['ingress']
+            if 'internal' in ingress_override:
+                ingress_config['external'] = not ingress_override['internal']
+            if 'external' in ingress_override:
+                ingress_config['external'] = ingress_override['external']
+            if 'allowInsecure' in ingress_override:
+                ingress_config['allowInsecure'] = ingress_override['allowInsecure']
+            logger.info(f"Applied ingress overrides from x-azure-deployment: {ingress_override}")
     
     # Build container app definition
     container_app_def = {
@@ -435,12 +603,7 @@ def create_models_container_app(cmd, resource_group_name, env_name, env_id, mode
             'environmentId': env_id,
             'workloadProfileName': gpu_profile_name,
             'configuration': {
-                'ingress': {
-                    'external': False,
-                    'targetPort': 8000,
-                    'transport': 'http',
-                    'allowInsecure': False
-                }
+                'ingress': ingress_config
             },
             'template': {
                 'containers': containers,
@@ -452,10 +615,26 @@ def create_models_container_app(cmd, resource_group_name, env_name, env_id, mode
         }
     }
     
-    # Create the container app
+    # Create the container app using REST API
     try:
-        client = ContainerAppClient(cmd.cli_ctx)
-        models_app = client.create_or_update(resource_group_name, app_name, container_app_def)
+        from azure.cli.core.util import send_raw_request
+        from azure.cli.core.commands.client_factory import get_subscription_id
+        
+        management_hostname = cmd.cli_ctx.cloud.endpoints.resource_manager
+        sub_id = get_subscription_id(cmd.cli_ctx)
+        api_version = "2024-03-01"
+        
+        url_fmt = "{}/subscriptions/{}/resourceGroups/{}/providers/Microsoft.App/containerApps/{}?api-version={}"
+        request_url = url_fmt.format(
+            management_hostname.strip('/'),
+            sub_id,
+            resource_group_name,
+            app_name,
+            api_version
+        )
+        
+        r = send_raw_request(cmd.cli_ctx, "PUT", request_url, body=json.dumps(container_app_def))
+        models_app = r.json()
         logger.info(f"Successfully created models container app: {app_name}")
         return models_app
     except Exception as e:
@@ -566,17 +745,15 @@ def enable_managed_identity(cmd, resource_group_name, app_name):
         Dictionary with identity information including principal_id
     """
     from knack.log import get_logger
-    from azure.cli.command_modules.containerapp._clients import ContainerAppClient
+    from ._clients import ContainerAppClient
     
     logger = get_logger(__name__)
     
     logger.info(f"Enabling system-assigned managed identity for '{app_name}'")
     
     try:
-        client = ContainerAppClient(cmd.cli_ctx)
-        
-        # Get current app
-        app = client.show(resource_group_name, app_name)
+        # Get current app using show classmethod
+        app = ContainerAppClient.show(cmd, resource_group_name, app_name)
         
         # Set identity type to SystemAssigned
         if 'identity' not in app:
@@ -584,8 +761,8 @@ def enable_managed_identity(cmd, resource_group_name, app_name):
         
         app['identity']['type'] = 'SystemAssigned'
         
-        # Update the app
-        updated_app = client.create_or_update(resource_group_name, app_name, app)
+        # Update the app using create_or_update classmethod
+        updated_app = ContainerAppClient.create_or_update(cmd, resource_group_name, app_name, app)
         
         identity = updated_app.get('identity', {})
         principal_id = identity.get('principalId')
@@ -604,14 +781,14 @@ def enable_managed_identity(cmd, resource_group_name, app_name):
 
 def attempt_role_assignment(cmd, principal_id, resource_group_name, app_name):
     """
-    Attempt to assign Azure AI Developer role to managed identity.
-    Falls back gracefully with warning if assignment fails.
+    Attempt to assign Container Apps Contributor role to managed identity at resource group scope.
+    This allows the MCP gateway to modify container apps to add MCP server containers.
     
     Args:
         cmd: Azure CLI command context
         principal_id: Principal ID of the managed identity
         resource_group_name: Resource group name
-        app_name: Container app name (for logging)
+        app_name: Container app name
         
     Returns:
         Boolean indicating if assignment succeeded
@@ -621,21 +798,22 @@ def attempt_role_assignment(cmd, principal_id, resource_group_name, app_name):
     
     logger = get_logger(__name__)
     
-    # Azure AI Developer role ID
-    role_definition_id = "64702f94-c441-49e6-a78b-ef80e0188fee"
+    # Use the specific role definition ID for container app management
+    # This role allows the MCP gateway to modify container apps
+    role_definition_id = "/subscriptions/30501c6c-81f6-41ac-a388-d29cf43a020d/providers/Microsoft.Authorization/roleDefinitions/358470bc-b998-42bd-ab17-a7e34c199c0f"
     
-    # Build scope (resource group level)
+    # Build scope - resource group level
     subscription_id = get_subscription_id(cmd.cli_ctx)
     scope = f"/subscriptions/{subscription_id}/resourceGroups/{resource_group_name}"
     
-    logger.info(f"Attempting to assign 'Azure AI Developer' role to principal {principal_id}")
-    logger.info(f"Scope: {scope}")
+    logger.info(f"Attempting to assign role to principal {principal_id}")
+    logger.info(f"Scope: Resource Group '{resource_group_name}'")
     
     try:
         # Import role assignment function
         from azure.cli.command_modules.role.custom import create_role_assignment
         
-        # Attempt role assignment
+        # Attempt role assignment using the full role definition ID
         create_role_assignment(
             cmd,
             role=role_definition_id,
@@ -644,7 +822,7 @@ def attempt_role_assignment(cmd, principal_id, resource_group_name, app_name):
             assignee_principal_type='ServicePrincipal'
         )
         
-        logger.info(f"✅ Successfully assigned 'Azure AI Developer' role to '{app_name}'")
+        logger.info(f"✅ Successfully assigned role to '{app_name}' managed identity")
         return True
         
     except Exception as e:
@@ -654,7 +832,7 @@ def attempt_role_assignment(cmd, principal_id, resource_group_name, app_name):
         logger.warning("")
         logger.warning("To manually assign the role, run:")
         logger.warning(f"  az role assignment create \\")
-        logger.warning(f"    --role 'Azure AI Developer' \\")
+        logger.warning(f"    --role '{role_definition_id}' \\")
         logger.warning(f"    --assignee-object-id {principal_id} \\")
         logger.warning(f"    --assignee-principal-type ServicePrincipal \\")
         logger.warning(f"    --scope {scope}")
@@ -1130,12 +1308,10 @@ def check_containerapp_exists(cmd, resource_group_name, app_name):
     Returns:
         Existing containerapp object if it exists, None otherwise
     """
-    from azure.cli.command_modules.containerapp._clients import ContainerAppClient
     from azure.core.exceptions import ResourceNotFoundError
     
     try:
-        client = ContainerAppClient(cmd)
-        existing_app = client.show(resource_group_name=resource_group_name, name=app_name)
+        existing_app = ContainerAppClient.show(cmd, resource_group_name=resource_group_name, name=app_name)
         return existing_app
     except ResourceNotFoundError:
         return None
@@ -1230,7 +1406,6 @@ def update_containerapp_from_compose(cmd, resource_group_name, app_name,
     Returns:
         Updated containerapp object
     """
-    from azure.cli.command_modules.containerapp._clients import ContainerAppClient
     from azure.cli.command_modules.containerapp.custom import update_containerapp
     
     if logger:
