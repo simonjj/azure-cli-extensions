@@ -1717,6 +1717,21 @@ def create_containerapps_from_compose(cmd,  # pylint: disable=R0914
             environment.extend(secret_env_ref)
         elif secret_env_ref is not None:
             environment = secret_env_ref
+        
+        # Strip ports from URLs in environment variables for ACA (Envoy handles port mapping)
+        if environment is not None:
+            import re
+            for env_var in environment:
+                if isinstance(env_var, dict) and 'value' in env_var:
+                    # Match http://hostname:port or https://hostname:port patterns
+                    env_var['value'] = re.sub(r'(https?://[^:/]+):\d+', r'\1', env_var['value'])
+                elif isinstance(env_var, str) and '=' in env_var:
+                    # Handle string format "KEY=VALUE"
+                    key, value = env_var.split('=', 1)
+                    value = re.sub(r'(https?://[^:/]+):\d+', r'\1', value)
+                    # Update the environment list item
+                    idx = environment.index(env_var)
+                    environment[idx] = f"{key}={value}"
 
         
         # Phase 4.5: Inject MCP Gateway Environment Variables

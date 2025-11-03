@@ -493,7 +493,7 @@ def create_models_container_app(cmd, resource_group_name, env_name, env_id, mode
     logger.info(f"Creating models container app '{app_name}' with GPU profile '{gpu_profile_name}'")
     
     # Determine GPU-appropriate resources based on profile type
-    # T4 GPU: 8 vCPUs, 32GB memory (NC8as_T4_v3)
+    # T4 GPU: 8 vCPUs, 56GB memory (NC8as_T4_v3)
     # A100 GPU: 24 vCPUs, 220GB memory (NC24ads_A100_v4)
     if 'A100' in gpu_profile_name.upper():
         gpu_cpu = 24.0
@@ -502,7 +502,7 @@ def create_models_container_app(cmd, resource_group_name, env_name, env_id, mode
     else:
         # Default to T4 resources
         gpu_cpu = 8.0
-        gpu_memory = '32Gi'
+        gpu_memory = '56Gi'
         logger.info(f"Detected T4 GPU profile - setting resources to {gpu_cpu} CPU / {gpu_memory}")
     
     # Build model configuration for model-runner-config
